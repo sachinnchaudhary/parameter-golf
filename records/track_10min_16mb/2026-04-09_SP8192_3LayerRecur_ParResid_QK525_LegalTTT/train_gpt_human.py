@@ -348,29 +348,79 @@ def eval_val_sliding(h,device,val_data,base_model,batch_seqs=32):
 	if dist.is_available()and dist.is_initialized():dist.all_reduce(loss_sum,op=dist.ReduceOp.SUM);dist.all_reduce(token_count,op=dist.ReduceOp.SUM);dist.all_reduce(byte_count,op=dist.ReduceOp.SUM)
 	base_model.train();return _loss_bpb(loss_sum,token_count,byte_count)
 def _normalize_ttt_param_scope(scope):
-	scope=(scope or'full').strip().lower();aliases={'full':'full','control':'control_only','control_only':'control_only','control-only':'control_only','qk_scale':'qk_scale_only','qk-scale':'qk_scale_only','qk_scale_only':'qk_scale_only'}
-	if scope not in aliases:raise ValueError(f"Unsupported TTT_PARAM_SCOPE={scope!r}; expected one of full, control_only, qk_scale_only")
+	scope=(scope or'full').strip().lower()
+	aliases={'full':'full','control':'control_only','control_only':'control_only','control-only':'control_only','qk_scale':'qk_scale_only','qk-scale':'qk_scale_only','qk_scale_only':'qk_scale_only','control_then_late':'control_then_late','control-then-late':'control_then_late','control_late':'control_then_late','late_control':'control_then_late'}
+	if scope not in aliases:raise ValueError(f"Unsupported TTT_PARAM_SCOPE={scope!r}; expected one of full, control_only, qk_scale_only, control_then_late")
 	return aliases[scope]
 def _ttt_scope_patterns(scope):
 	if scope=='control_only':return('q_gain','attn_scale','mlp_scale','resid_mix','skip_gates','skip_weights','skip_weight','norm.weight')
 	if scope=='qk_scale_only':return('q_gain','attn_scale','mlp_scale')
 	return tuple()
+def _is_ttt_control_param(name):
+	return any(pattern in name for pattern in('q_gain','attn_scale','mlp_scale','resid_mix','skip_gates','skip_weights','skip_weight'))
+def _is_ttt_late_matrix_param(name):
+	parts=name.split('.')
+	if len(parts)<4 or parts[0]!='blocks' or not parts[1].isdigit() or not name.endswith('.weight'):return False
+	layer=int(parts[1])
+	return 7<=layer<=10 and parts[2]in('attn','mlp')
+def _dedupe_named_params(named_params):
+	seen=set();out=[]
+	for name,p in named_params:
+		if id(p)not in seen:seen.add(id(p));out.append((name,p))
+	return out
 def _select_ttt_named_params(base_model,scope):
 	scope=_normalize_ttt_param_scope(scope)
 	if scope=='full':return scope,list(base_model.named_parameters())
+	if scope=='control_then_late':
+		selected=[(name,p)for(name,p)in base_model.named_parameters()if _is_ttt_control_param(name)or _is_ttt_late_matrix_param(name)]
+		return scope,_dedupe_named_params(selected)
 	patterns=_ttt_scope_patterns(scope);selected=[(name,p)for(name,p)in base_model.named_parameters()if any(pattern in name for pattern in patterns)]
 	return scope,selected
+def _set_ttt_trainable(base_model,active_params):
+	active_ids={id(p)for p in active_params}
+	for p in base_model.parameters():p.requires_grad_(id(p)in active_ids)
+def _ttt_cos_lr(base_lr,ci,num_chunks):
+	return base_lr*.5*(1.+math.cos(math.pi*ci/max(num_chunks-1,1)))
+def _run_ttt_chunk_updates(h,device,val_data,base_model,rank,world_size,seq_len,batch_seqs,chunk_start,chunk_end,ci,num_chunks,active_params,optimizer,epochs,base_lr):
+	if epochs<=0 or not active_params:return
+	chunk_seqs=(chunk_end-chunk_start)//seq_len
+	if chunk_seqs<=0:return
+	_set_ttt_trainable(base_model,active_params);base_model.train();cos_lr=_ttt_cos_lr(base_lr,ci,num_chunks)
+	for pg in optimizer.param_groups:pg['lr']=cos_lr
+	my_seq_s=chunk_seqs*rank//world_size;my_seq_e=chunk_seqs*(rank+1)//world_size;my_chunk_seqs=my_seq_e-my_seq_s
+	for _ep in range(epochs):
+		for bs in range(0,my_chunk_seqs,batch_seqs):
+			be=min(bs+batch_seqs,my_chunk_seqs);actual_bs=my_seq_s+bs;start_tok=chunk_start+actual_bs*seq_len;end_tok=chunk_start+(my_seq_s+be)*seq_len+1
+			if end_tok>val_data.val_tokens.numel():continue
+			local=val_data.val_tokens[start_tok:end_tok].to(device=device,dtype=torch.int64);x=local[:-1].reshape(-1,seq_len);y=local[1:].reshape(-1,seq_len);optimizer.zero_grad(set_to_none=True)
+			with torch.autocast(device_type='cuda',dtype=torch.bfloat16):loss=base_model(x,y)
+			loss.backward()
+			if world_size>1:
+				for p in active_params:
+					if p.grad is not None:dist.all_reduce(p.grad,op=dist.ReduceOp.AVG)
+			torch.nn.utils.clip_grad_norm_(active_params,1.);optimizer.step()
 def eval_val_ttt(h,device,val_data,base_model,batch_seqs=32):
 	rank=h.rank;world_size=h.world_size;seq_len=h.eval_seq_len;stride=h.eval_stride;total_tokens=val_data.val_tokens.numel()-1;ttt_chunk=h.ttt_chunk_tokens;context_size=seq_len-stride;window_starts=[ws for ws in range(0,total_tokens,stride)if ws+context_size<total_tokens];num_chunks=(total_tokens+ttt_chunk-1)//ttt_chunk;chunk_windows=[[]for _ in range(num_chunks)]
 	for ws in window_starts:wlen=min(ws+seq_len,total_tokens)-ws;s=0 if ws==0 else context_size;scored_start=ws+s;ci=min(scored_start//ttt_chunk,num_chunks-1);chunk_windows[ci].append(ws)
 	ttt_scope,ttt_named_params=_select_ttt_named_params(base_model,h.ttt_param_scope);ttt_params=[p for(_,p)in ttt_named_params]
 	if not ttt_params:raise RuntimeError(f"No TTT parameters selected for scope={ttt_scope!r}")
 	for p in base_model.parameters():p.requires_grad_(False)
-	for p in ttt_params:p.requires_grad_(True)
-	log(f"ttt:start chunks={num_chunks} ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs} scope={ttt_scope}");log(f"ttt:params tensors={len(ttt_params)} numel={sum(p.numel()for p in ttt_params)}")
+	if ttt_scope=='control_then_late':log(f"ttt:start chunks={num_chunks} scope={ttt_scope} schedule=phase1_control_epochs1_lr0.01_phase2_control_late7_10_epochs2_lr0.003")
+	else:log(f"ttt:start chunks={num_chunks} ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs} scope={ttt_scope}")
+	log(f"ttt:params tensors={len(ttt_params)} numel={sum(p.numel()for p in ttt_params)}")
 	if h.is_main_process:log(f"ttt:selected_tensors: {', '.join(name for(name,_)in ttt_named_params)}")
 	compiled_logits=torch.compile(base_model.forward_logits,dynamic=False,fullgraph=True);loss_sum=torch.zeros((),device=device,dtype=torch.float64);token_count=torch.zeros((),device=device,dtype=torch.float64);byte_count=torch.zeros((),device=device,dtype=torch.float64)
-	optimizer=torch.optim.SGD(ttt_params,lr=h.ttt_lr,momentum=h.ttt_momentum)
+	if ttt_scope=='control_then_late':
+		phase1_named=[(name,p)for(name,p)in base_model.named_parameters()if _is_ttt_control_param(name)]
+		phase2_named=_dedupe_named_params(phase1_named+[(name,p)for(name,p)in base_model.named_parameters()if _is_ttt_late_matrix_param(name)])
+		phase1_params=[p for(_,p)in phase1_named];phase2_params=[p for(_,p)in phase2_named]
+		optimizer_phase1=torch.optim.SGD(phase1_params,lr=.01,momentum=h.ttt_momentum)
+		optimizer_phase2=torch.optim.SGD(phase2_params,lr=.003,momentum=h.ttt_momentum)
+		log(f"ttt:phase1 scope=control tensors={len(phase1_params)} numel={sum(p.numel()for p in phase1_params)} epochs=1 lr=0.01")
+		log(f"ttt:phase2 scope=control_plus_late7_10 tensors={len(phase2_params)} numel={sum(p.numel()for p in phase2_params)} epochs=2 lr=0.003")
+		if h.is_main_process:log(f"ttt:phase2_extra_tensors: {', '.join(name for(name,p)in phase2_named if _is_ttt_late_matrix_param(name))}")
+	else:
+		optimizer=torch.optim.SGD(ttt_params,lr=h.ttt_lr,momentum=h.ttt_momentum)
 	for ci in range(num_chunks):
 		windows=chunk_windows[ci]
 		if not windows:continue
@@ -383,23 +433,12 @@ def eval_val_ttt(h,device,val_data,base_model,batch_seqs=32):
 				nll=F.cross_entropy(logits.reshape(-1,logits.size(-1)).float(),y_batch.reshape(-1),reduction='none').reshape(bsz,seq_len)
 				for(i,ws)in enumerate(batch_ws):wlen=wlens[i];s=0 if ws==0 else context_size;scored_nll=nll[i,s:wlen].to(torch.float64);loss_sum+=scored_nll.sum();token_count+=float(wlen-s);tgt=y_batch[i,s:wlen];prev=x_batch[i,s:wlen];tb=val_data.base_bytes_lut[tgt].to(torch.float64);tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64);byte_count+=tb.sum()
 		is_last_chunk=ci==num_chunks-1
-		if not is_last_chunk and h.ttt_epochs>0:
-			base_model.train();chunk_seqs=(chunk_end-chunk_start)//seq_len
-			if chunk_seqs>0:
-				cos_lr=h.ttt_lr*.5*(1.+math.cos(math.pi*ci/max(num_chunks-1,1)))
-				for pg in optimizer.param_groups:pg['lr']=cos_lr
-				my_seq_s=chunk_seqs*rank//world_size;my_seq_e=chunk_seqs*(rank+1)//world_size;my_chunk_seqs=my_seq_e-my_seq_s
-				for _ep in range(h.ttt_epochs):
-					for bs in range(0,my_chunk_seqs,batch_seqs):
-						be=min(bs+batch_seqs,my_chunk_seqs);actual_bs=my_seq_s+bs;start_tok=chunk_start+actual_bs*seq_len;end_tok=chunk_start+(my_seq_s+be)*seq_len+1
-						if end_tok>val_data.val_tokens.numel():continue
-						local=val_data.val_tokens[start_tok:end_tok].to(device=device,dtype=torch.int64);x=local[:-1].reshape(-1,seq_len);y=local[1:].reshape(-1,seq_len);optimizer.zero_grad(set_to_none=True)
-						with torch.autocast(device_type='cuda',dtype=torch.bfloat16):loss=base_model(x,y)
-						loss.backward()
-						if world_size>1:
-							for p in ttt_params:
-								if p.grad is not None:dist.all_reduce(p.grad,op=dist.ReduceOp.AVG)
-						torch.nn.utils.clip_grad_norm_(ttt_params,1.);optimizer.step()
+		if not is_last_chunk:
+			if ttt_scope=='control_then_late':
+				_run_ttt_chunk_updates(h,device,val_data,base_model,rank,world_size,seq_len,batch_seqs,chunk_start,chunk_end,ci,num_chunks,phase1_params,optimizer_phase1,1,.01)
+				_run_ttt_chunk_updates(h,device,val_data,base_model,rank,world_size,seq_len,batch_seqs,chunk_start,chunk_end,ci,num_chunks,phase2_params,optimizer_phase2,2,.003)
+			else:
+				_run_ttt_chunk_updates(h,device,val_data,base_model,rank,world_size,seq_len,batch_seqs,chunk_start,chunk_end,ci,num_chunks,ttt_params,optimizer,h.ttt_epochs,h.ttt_lr)
 	if dist.is_available()and dist.is_initialized():dist.all_reduce(loss_sum,op=dist.ReduceOp.SUM);dist.all_reduce(token_count,op=dist.ReduceOp.SUM);dist.all_reduce(byte_count,op=dist.ReduceOp.SUM)
 	for p in base_model.parameters():p.requires_grad_(True)
 	base_model.eval();return _loss_bpb(loss_sum,token_count,byte_count)
