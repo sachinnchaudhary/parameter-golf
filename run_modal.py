@@ -131,6 +131,39 @@ def _persist_outputs(run_id: str) -> None:
     print(f"[modal] persisted {copied} output files to {out_dir}", flush=True)
 
 
+def _restore_checkpoint_outputs(checkpoint_run_id: str) -> None:
+    src_dir = Path(CACHE_ROOT) / "runs" / checkpoint_run_id
+    if not src_dir.exists():
+        raise FileNotFoundError(f"No cached run found at {src_dir}")
+
+    copied = 0
+    for pattern in ("final_model.pt", "final_model.*.ptz"):
+        for src in src_dir.glob(pattern):
+            shutil.copy2(src, Path(REPO_DIR) / src.name)
+            copied += 1
+
+    quantized_path = Path(REPO_DIR) / "final_model.int6.ptz"
+    if not quantized_path.exists():
+        raise FileNotFoundError(f"Cached run {checkpoint_run_id!r} does not contain final_model.int6.ptz")
+    print(f"[modal] restored {copied} checkpoint files from {src_dir}", flush=True)
+
+
+def _assert_eval_only_script_support(script_path: str) -> None:
+    path = Path(REPO_DIR) / script_path
+    if not path.exists():
+        raise FileNotFoundError(f"Training script not found: {path}")
+
+    # The packed script is opaque, so use the human-readable script for eval-only
+    # ablations unless you have verified and repacked the same logic.
+    if path.name.endswith("_human.py"):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if "EVAL_ONLY" not in text or "eval_only:using existing quantized checkpoint" not in text:
+            raise RuntimeError(
+                f"{script_path} does not contain the eval-only checkpoint path. "
+                "Push the eval-only train_gpt_human.py changes before running B/C."
+            )
+
+
 @app.function(
     gpu="H100:8",
     cpu=32,
@@ -158,6 +191,8 @@ def run_training(
     recurrence_ramp_end_frac: float = 0.515,
     enable_looping_at: float = 0.50,
     qk_gain_init_by_layer: str = "",
+    eval_only: int = 0,
+    checkpoint_run_id: str = "",
     ttt_enabled: int = 0,
     ttt_param_scope: str = "full",
     ttt_lr: float = 0.005,
@@ -173,6 +208,13 @@ def run_training(
         shutil.rmtree(REPO_DIR)
     _run(["git", "clone", "--depth", "1", "--branch", branch, repo_url, REPO_DIR])
     _ensure_cache_symlinks()
+    if checkpoint_run_id and not eval_only:
+        raise ValueError("--checkpoint-run-id is only valid with --eval-only 1")
+    if eval_only:
+        if checkpoint_run_id == "":
+            raise ValueError("--checkpoint-run-id is required when --eval-only is set")
+        _assert_eval_only_script_support(script_path)
+        _restore_checkpoint_outputs(checkpoint_run_id)
 
     env = os.environ.copy()
     env["MATCHED_FINEWEB_REPO_ID"] = hf_repo_id
@@ -209,6 +251,7 @@ def run_training(
             "RECURRENCE_RAMP_END_FRAC": str(recurrence_ramp_end_frac),
             "ENABLE_LOOPING_AT": str(enable_looping_at),
             "QK_GAIN_INIT_BY_LAYER": qk_gain_init_by_layer,
+            "EVAL_ONLY": str(eval_only),
             "TTT_ENABLED": str(ttt_enabled),
             "TTT_PARAM_SCOPE": ttt_param_scope,
             "TTT_LR": str(ttt_lr),
@@ -254,6 +297,8 @@ def main(
     recurrence_ramp_end_frac: float = 0.515,
     enable_looping_at: float = 0.50,
     qk_gain_init_by_layer: str = "",
+    eval_only: int = 0,
+    checkpoint_run_id: str = "",
     ttt_enabled: int = 0,
     ttt_param_scope: str = "full",
     ttt_lr: float = 0.005,
@@ -281,6 +326,8 @@ def main(
         recurrence_ramp_end_frac=recurrence_ramp_end_frac,
         enable_looping_at=enable_looping_at,
         qk_gain_init_by_layer=qk_gain_init_by_layer,
+        eval_only=eval_only,
+        checkpoint_run_id=checkpoint_run_id,
         ttt_enabled=ttt_enabled,
         ttt_param_scope=ttt_param_scope,
         ttt_lr=ttt_lr,
