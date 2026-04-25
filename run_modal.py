@@ -157,6 +157,13 @@ def run_training(
     recurrence_ramp_mid_frac: float = 0.50,
     recurrence_ramp_end_frac: float = 0.515,
     enable_looping_at: float = 0.50,
+    qk_gain_init_by_layer: str = "",
+    ttt_enabled: int = 0,
+    ttt_param_scope: str = "full",
+    ttt_lr: float = 0.005,
+    ttt_epochs: int = 3,
+    ttt_momentum: float = 0.9,
+    ttt_chunk_tokens: int = 32768,
 ) -> None:
     if hf_repo_id == "":
         hf_repo_id = "kevclark/parameter-golf" if variant == "sp8192" else "willdepueoai/parameter-golf"
@@ -201,6 +208,13 @@ def run_training(
             "RECURRENCE_RAMP_MID_FRAC": str(recurrence_ramp_mid_frac),
             "RECURRENCE_RAMP_END_FRAC": str(recurrence_ramp_end_frac),
             "ENABLE_LOOPING_AT": str(enable_looping_at),
+            "QK_GAIN_INIT_BY_LAYER": qk_gain_init_by_layer,
+            "TTT_ENABLED": str(ttt_enabled),
+            "TTT_PARAM_SCOPE": ttt_param_scope,
+            "TTT_LR": str(ttt_lr),
+            "TTT_EPOCHS": str(ttt_epochs),
+            "TTT_MOMENTUM": str(ttt_momentum),
+            "TTT_CHUNK_TOKENS": str(ttt_chunk_tokens),
         }
     )
 
@@ -239,6 +253,13 @@ def main(
     recurrence_ramp_mid_frac: float = 0.50,
     recurrence_ramp_end_frac: float = 0.515,
     enable_looping_at: float = 0.50,
+    qk_gain_init_by_layer: str = "",
+    ttt_enabled: int = 0,
+    ttt_param_scope: str = "full",
+    ttt_lr: float = 0.005,
+    ttt_epochs: int = 3,
+    ttt_momentum: float = 0.9,
+    ttt_chunk_tokens: int = 32768,
 ) -> None:
     run_training.remote(
         repo_url=repo_url,
@@ -259,4 +280,11 @@ def main(
         recurrence_ramp_mid_frac=recurrence_ramp_mid_frac,
         recurrence_ramp_end_frac=recurrence_ramp_end_frac,
         enable_looping_at=enable_looping_at,
+        qk_gain_init_by_layer=qk_gain_init_by_layer,
+        ttt_enabled=ttt_enabled,
+        ttt_param_scope=ttt_param_scope,
+        ttt_lr=ttt_lr,
+        ttt_epochs=ttt_epochs,
+        ttt_momentum=ttt_momentum,
+        ttt_chunk_tokens=ttt_chunk_tokens,
     )
